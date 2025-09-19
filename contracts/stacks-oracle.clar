@@ -213,3 +213,219 @@
         )
     )
 )
+
+;; Oracle Market Resolution
+(define-public (resolve-market (market-id uint) (end-price uint))
+    (let
+        (
+            (market (unwrap! (map-get? markets market-id) ERR_MARKET_NOT_FOUND))
+            (current-block stacks-block-height)
+        )
+        ;; Oracle Authorization Check
+        (asserts! (is-eq tx-sender (var-get oracle-address)) ERR_UNAUTHORIZED)
+        (asserts! (>= current-block (get end-block market)) ERR_MARKET_CLOSED)
+        (asserts! (not (get resolved market)) ERR_ALREADY_RESOLVED)
+        (asserts! (> end-price u0) ERR_INVALID_PRICE)
+
+        ;; Market Resolution
+        (map-set markets market-id
+            (merge market
+                {
+                    end-price: end-price,
+                    resolved: true,
+                    resolution-block: current-block
+                }
+            )
+        )
+        (ok {market-id: market-id, end-price: end-price})
+    )
+)
+
+;; Claim Winnings Distribution
+(define-public (claim-winnings (market-id uint))
+    (let
+        (
+            (market (unwrap! (map-get? markets market-id) ERR_MARKET_NOT_FOUND))
+            (prediction (unwrap! (map-get? user-predictions {market-id: market-id, user: tx-sender}) ERR_MARKET_NOT_FOUND))
+        )
+        ;; Claim Validation
+        (asserts! (get resolved market) ERR_MARKET_NOT_RESOLVED)
+        (asserts! (not (get claimed prediction)) ERR_ALREADY_CLAIMED)
+
+        (let
+            (
+                (winning-prediction (if (> (get end-price market) (get start-price market)) 
+                                   PREDICTION_UP 
+                                   PREDICTION_DOWN))
+                (total-pool (+ (get total-up-stake market) (get total-down-stake market)))
+                (winning-pool (if (is-eq winning-prediction PREDICTION_UP) 
+                               (get total-up-stake market) 
+                               (get total-down-stake market)))
+                (user-stake (get stake prediction))
+            )
+            ;; Winner Verification
+            (asserts! (is-eq (get prediction prediction) winning-prediction) ERR_INVALID_PREDICTION)
+            (asserts! (> winning-pool u0) ERR_INVALID_PARAMETER)
+            
+            (let
+                (
+                    (gross-winnings (/ (* user-stake total-pool) winning-pool))
+                    (platform-fee (/ (* gross-winnings (var-get platform-fee-percentage)) u100))
+                    (net-payout (- gross-winnings platform-fee))
+                )
+                ;; Payout Execution
+                (try! (as-contract (stx-transfer? net-payout (as-contract tx-sender) tx-sender)))
+                (try! (as-contract (stx-transfer? platform-fee (as-contract tx-sender) CONTRACT_OWNER)))
+                
+                ;; Record Updates
+                (map-set user-predictions 
+                    {market-id: market-id, user: tx-sender}
+                    (merge prediction {claimed: true})
+                )
+                
+                (update-user-stats tx-sender net-payout true)
+                (var-set total-fees-collected (+ (var-get total-fees-collected) platform-fee))
+                
+                (ok {payout: net-payout, fee: platform-fee})
+            )
+        )
+    )
+)
+
+;; READ-ONLY QUERY FUNCTIONS
+
+;; Detailed Market Information
+(define-read-only (get-market-details (market-id uint))
+    (match (map-get? markets market-id)
+        market (ok (merge market 
+            {
+                total-pool: (+ (get total-up-stake market) (get total-down-stake market)),
+                up-percentage: (if (> (+ (get total-up-stake market) (get total-down-stake market)) u0)
+                                 (/ (* (get total-up-stake market) u100) 
+                                    (+ (get total-up-stake market) (get total-down-stake market)))
+                                 u50),
+                is-active: (and (>= stacks-block-height (get start-block market))
+                               (< stacks-block-height (get end-block market))
+                               (not (get resolved market)))
+            }))
+        ERR_MARKET_NOT_FOUND
+    )
+)
+
+;; User Prediction Details
+(define-read-only (get-user-prediction-details (market-id uint) (user principal))
+    (match (map-get? user-predictions {market-id: market-id, user: user})
+        prediction (ok prediction)
+        ERR_MARKET_NOT_FOUND
+    )
+)
+
+;; User Performance Statistics
+(define-read-only (get-user-stats (user principal))
+    (default-to 
+        {total-predictions: u0, total-winnings: u0, total-losses: u0}
+        (map-get? user-stats user)
+    )
+)
+
+;; Platform-wide Metrics
+(define-read-only (get-platform-stats)
+    (ok {
+        total-markets: (var-get market-counter),
+        total-volume: (var-get total-volume),
+        total-fees: (var-get total-fees-collected),
+        contract-balance: (stx-get-balance (as-contract tx-sender)),
+        is-paused: (var-get protocol-paused)
+    })
+)
+
+;; Protocol Configuration View
+(define-read-only (get-platform-config)
+    (ok {
+        oracle-address: (var-get oracle-address),
+        minimum-stake: (var-get minimum-stake),
+        platform-fee: (var-get platform-fee-percentage),
+        protocol-paused: (var-get protocol-paused)
+    })
+)
+
+;; ADMINISTRATIVE CONTROLS
+
+;; Oracle Address Management
+(define-public (set-oracle-address (new-address principal))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+        (asserts! (not (is-eq new-address CONTRACT_OWNER)) ERR_INVALID_PARAMETER)
+        (asserts! (is-standard new-address) ERR_INVALID_PARAMETER)
+        (var-set oracle-address new-address)
+        (ok true)
+    )
+)
+
+;; Minimum Stake Configuration
+(define-public (set-minimum-stake (new-minimum uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+        (asserts! (> new-minimum u0) ERR_INVALID_PARAMETER)
+        (var-set minimum-stake new-minimum)
+        (ok true)
+    )
+)
+
+;; Fee Structure Management
+(define-public (set-platform-fee (new-fee uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+        (asserts! (<= new-fee MAX_FEE_PERCENTAGE) ERR_INVALID_PARAMETER)
+        (var-set platform-fee-percentage new-fee)
+        (ok true)
+    )
+)
+
+;; Emergency Protocol Controls
+(define-public (toggle-protocol-pause)
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+        (var-set protocol-paused (not (var-get protocol-paused)))
+        (ok (var-get protocol-paused))
+    )
+)
+
+;; Fee Collection Management
+(define-public (withdraw-fees (amount uint))
+    (let
+        (
+            (contract-balance (stx-get-balance (as-contract tx-sender)))
+        )
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_OWNER_ONLY)
+        (asserts! (<= amount contract-balance) ERR_INSUFFICIENT_BALANCE)
+        (try! (as-contract (stx-transfer? amount (as-contract tx-sender) CONTRACT_OWNER)))
+        (ok amount)
+    )
+)
+
+;; PRIVATE HELPER FUNCTIONS
+
+;; User Statistics Tracker
+(define-private (update-user-stats (user principal) (amount uint) (is-win bool))
+    (let
+        (
+            (current-stats (default-to 
+                {total-predictions: u0, total-winnings: u0, total-losses: u0}
+                (map-get? user-stats user)))
+        )
+        (map-set user-stats user
+            (merge current-stats
+                {
+                    total-predictions: (+ (get total-predictions current-stats) u1),
+                    total-winnings: (if is-win 
+                                   (+ (get total-winnings current-stats) amount)
+                                   (get total-winnings current-stats)),
+                    total-losses: (if (not is-win)
+                                 (+ (get total-losses current-stats) amount)
+                                 (get total-losses current-stats))
+                }
+            )
+        )
+    )
+)
